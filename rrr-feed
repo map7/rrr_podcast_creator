@@ -1,0 +1,233 @@
+#!/usr/bin/env python3
+"""Build a podcast RSS feed from a Triple R program's episode pages.
+
+RRR stopped publishing some programs as podcasts, but the episodes stay on
+the website and the web player streams them from the on-demand archive.
+This scrapes the episode listing and writes an RSS file that a podcast
+client can read.
+
+The audio URL is not in the page.  The player builds it from the broadcast
+timestamp and duration carried in each episode's data-view-playable blob:
+
+  https://playback.rrr.org.au/od-p1v1/_definst_/mp4:YYYYMM/
+      YYYYMMDDHHMM_<duration+360>_128.mp4/playlist.m3u8
+
+The +360 is fixed padding RRR's encoder adds to the slot length, verified
+against every episode that has audio.  The result is an HLS playlist, which
+mpv and ffmpeg play directly but wget cannot fetch.
+
+Episodes older than the on-demand window have no blob and so no audio; they
+are still listed, marked in the description, unless --playable-only.
+
+Usage:
+  rrr-feed byte-into-it -o ~/.local/share/rrr-feeds/byte-into-it.xml
+"""
+
+import argparse
+import html
+import json
+import os
+import re
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.request
+from email.utils import format_datetime
+from datetime import datetime, timezone, timedelta
+from xml.sax.saxutils import escape
+
+BASE = "https://www.rrr.org.au"
+STREAM = ("https://playback.rrr.org.au/od-p1v1/_definst_/"
+          "mp4:{ym}/{stamp}_{dur}_128.mp4/playlist.m3u8")
+PADDING = 360          # seconds RRR's encoder adds to the scheduled slot
+MELBOURNE = timezone(timedelta(hours=10))   # broadcast timestamps are local
+UA = "Mozilla/5.0 (rrr-feed; personal podcast bridge)"
+
+
+def fetch(url, retries=3):
+    for attempt in range(retries):
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": UA})
+            with urllib.request.urlopen(req, timeout=40) as r:
+                return r.read().decode("utf-8", "replace")
+        except (urllib.error.URLError, TimeoutError) as e:
+            if attempt == retries - 1:
+                raise
+            time.sleep(2 * (attempt + 1))
+
+
+def parse_page(page_html, slug):
+    """Yield one dict per episode card on a listing page."""
+    anchor = re.compile(
+        r'<a class="card__anchor" href="(/explore/programs/%s/episodes/[^"#]+)"[^>]*>(.*?)</a>'
+        % re.escape(slug), re.S)
+    marks = [(m.start(), m.group(1), m.group(2)) for m in anchor.finditer(page_html)]
+    for i, (pos, href, title) in enumerate(marks):
+        end = marks[i + 1][0] if i + 1 < len(marks) else len(page_html)
+        chunk = page_html[pos:end]
+        ep = {
+            "link": BASE + href,
+            "title": html.unescape(re.sub(r"<[^>]+>", "", title)).strip(),
+            "guid": href.rsplit("/", 1)[-1],
+            "summary": "",
+            "image": "",
+            "timestamp": None,
+            "duration": None,
+        }
+        meta = re.search(r'<span class="card__meta[^"]*">\s*<p>(.*?)</p>', chunk, re.S)
+        if meta:
+            ep["summary"] = html.unescape(re.sub(r"<[^>]+>", "", meta.group(1))).strip()
+        blob = re.search(r'data-view-playable="([^"]+)"', chunk)
+        if blob:
+            try:
+                j = json.loads(html.unescape(blob.group(1)))
+            except ValueError:
+                j = {}
+            for item in j.get("items", []):
+                data = item.get("data") or {}
+                if item.get("type") == "broadcast_episode" and data.get("timestamp"):
+                    ep["timestamp"] = data["timestamp"]
+                    ep["duration"] = data.get("duration")
+                    img = (data.get("image") or {}).get("path")
+                    if img:
+                        ep["image"] = img
+                    break
+        yield ep
+
+
+def stream_url(ep):
+    """Construct the on-demand HLS URL, or None when there is no audio."""
+    ts, dur = ep.get("timestamp"), ep.get("duration")
+    if not ts or not dur:
+        return None
+    return STREAM.format(ym=ts[:6], stamp=ts[:12], dur=int(dur) + PADDING)
+
+
+def pub_date(ep):
+    ts = ep.get("timestamp")
+    if ts:
+        try:
+            return datetime.strptime(ts[:14], "%Y%m%d%H%M%S").replace(tzinfo=MELBOURNE)
+        except ValueError:
+            pass
+    m = re.search(r"-(\d{1,2})-([a-z]+)-(\d{4})$", ep["guid"])
+    if m:
+        for fmt in ("%d %B %Y", "%d %b %Y"):
+            try:
+                return datetime.strptime(" ".join(m.groups()), fmt).replace(
+                    hour=19, tzinfo=MELBOURNE)
+            except ValueError:
+                continue
+    return None
+
+
+def scrape(slug, max_pages=40, verbose=False):
+    episodes, seen, page = [], set(), 1
+    while page <= max_pages:
+        url = "%s/explore/programs/%s/episodes/page?page=%d" % (BASE, slug, page)
+        body = fetch(url)
+        found = 0
+        for ep in parse_page(body, slug):
+            if ep["guid"] in seen:
+                continue
+            seen.add(ep["guid"])
+            episodes.append(ep)
+            found += 1
+        if verbose:
+            playable = sum(1 for e in episodes[-found:] if stream_url(e)) if found else 0
+            print("  page %-3d %3d episodes, %3d with audio" % (page, found, playable),
+                  file=sys.stderr)
+        if found == 0:
+            break
+        page += 1
+    return episodes
+
+
+def build_rss(slug, episodes, playable_only=False):
+    title = "Byte Into IT" if slug == "byte-into-it" else slug.replace("-", " ").title()
+    home = "%s/explore/programs/%s" % (BASE, slug)
+    cover = next((e["image"] for e in episodes if e.get("image")), "")
+    now = format_datetime(datetime.now(timezone.utc))
+
+    out = ['<?xml version="1.0" encoding="UTF-8"?>',
+           '<rss version="2.0" xmlns:itunes="http://www.itunes.com/dtds/podcast-1.0.dtd">',
+           '<channel>',
+           '<title>%s</title>' % escape(title),
+           '<link>%s</link>' % escape(home),
+           '<description>%s</description>' % escape(
+               "Episodes of %s on Triple R, rebuilt from the station's episode "
+               "pages because the official podcast feed stopped updating. Audio "
+               "is the on-demand HLS stream, playable with mpv or ffmpeg."
+               % title),
+           '<language>en-au</language>',
+           '<lastBuildDate>%s</lastBuildDate>' % now,
+           '<generator>rrr-feed</generator>']
+    if cover:
+        out.append('<itunes:image href="%s" />' % escape(cover))
+
+    count = 0
+    for ep in episodes:
+        audio = stream_url(ep)
+        if playable_only and not audio:
+            continue
+        when = pub_date(ep)
+        desc = ep["summary"] or ep["title"]
+        if not audio:
+            desc += (" [Audio is outside RRR's on-demand window, so this entry "
+                     "links to the episode page only.]")
+        out.append('<item>')
+        out.append('<title>%s</title>' % escape(ep["title"]))
+        out.append('<link>%s</link>' % escape(ep["link"]))
+        out.append('<guid isPermaLink="false">%s</guid>' % escape(ep["guid"]))
+        out.append('<description>%s</description>' % escape(desc))
+        if when:
+            out.append('<pubDate>%s</pubDate>' % format_datetime(when))
+        if audio:
+            out.append('<enclosure url="%s" type="application/vnd.apple.mpegurl" length="0" />'
+                       % escape(audio))
+            if ep.get("duration"):
+                out.append('<itunes:duration>%d</itunes:duration>' % int(ep["duration"]))
+        if ep.get("image"):
+            out.append('<itunes:image href="%s" />' % escape(ep["image"]))
+        out.append('</item>')
+        count += 1
+
+    out.append('</channel>')
+    out.append('</rss>')
+    return "\n".join(out), count
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("slug", help="program slug, e.g. byte-into-it")
+    p.add_argument("-o", "--output", required=True, help="RSS file to write")
+    p.add_argument("--playable-only", action="store_true",
+                   help="skip episodes whose audio has aged out of the archive")
+    p.add_argument("--max-pages", type=int, default=40)
+    p.add_argument("-v", "--verbose", action="store_true")
+    args = p.parse_args()
+
+    episodes = scrape(args.slug, args.max_pages, args.verbose)
+    if not episodes:
+        print("rrr-feed: no episodes found for %s" % args.slug, file=sys.stderr)
+        return 1
+    xml, count = build_rss(args.slug, episodes, args.playable_only)
+
+    dest = os.path.expanduser(args.output)
+    os.makedirs(os.path.dirname(dest), exist_ok=True)
+    # Write via a temp file so a reader never sees a half-written feed.
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(dest), suffix=".tmp")
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        fh.write(xml)
+    os.replace(tmp, dest)
+
+    playable = sum(1 for e in episodes if stream_url(e))
+    print("rrr-feed: %d episodes (%d with audio) -> %s"
+          % (count, playable, dest), file=sys.stderr)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

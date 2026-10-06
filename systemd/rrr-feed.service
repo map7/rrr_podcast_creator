@@ -1,0 +1,18 @@
+[Unit]
+Description=Rebuild the Byte Into IT podcast feed from Triple R's episode pages
+# Triple R stopped publishing this show as a podcast in Feb 2025, but keeps
+# broadcasting it and keeps the episodes on the website.  rrr-feed scrapes
+# the episode listing and writes an RSS file that elfeed reads over file://.
+Documentation=https://www.rrr.org.au/explore/programs/byte-into-it
+
+[Service]
+Type=oneshot
+# --playable-only keeps the feed to episodes still inside RRR's on-demand
+# window.  Drop it to list the whole back catalogue as link-only entries.
+ExecStart=%h/code/rrr_podcast_creator/rrr-feed byte-into-it --playable-only -o %h/.local/share/rrr-feeds/byte-into-it.xml
+# Scraping a website is best-effort; a failed run leaves the previous feed
+# in place rather than an empty one, so do not nag about it.
+SuccessExitStatus=1
+
+[Install]
+WantedBy=default.target
